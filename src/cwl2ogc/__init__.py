@@ -16,6 +16,7 @@ from abc import (
     ABC,
     abstractmethod
 )
+import copy
 from cwl_utils.parser import (
     cwl_v1_0,
     cwl_v1_1,
@@ -204,20 +205,37 @@ class BaseCWLtypes2OGCConverter(__CWLtypes2OGCConverter__):
         _map_type("boolean", lambda input : { "type": "boolean" })
         _map_type(["string", "stdout"], lambda input : { "type": "string" })
 
-        _map_type(["File", File], lambda input : {
-                                                    "oneOf": [
-                                                        { "type": "string", "format": "uri" },
-                                                        { "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/item.json" }
-                                                    ]
-                                                })
+        def _file_mapper(input):
+            # Check if input has format attribute
+            if hasattr(input, 'format') and input.format:
+                resolved_format = self._resolve_format(input.format)
+                if resolved_format:
+                    # If we have a specific format, use a simple schema with contentMediaType
+                    schema = {
+                        "type": "string",
+                        "contentEncoding": "binary",
+                        "contentMediaType": resolved_format
+                    }
+                    return schema
+
+            # Default schema without format (generic file alternatives)
+            schema = {
+                "oneOf": [
+                    { "type": "string", "format": "uri" },
+                    { "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/item.json" }
+                ]
+            }
+            return schema
+
+        _map_type(["File", File], _file_mapper)
+
         _map_type(["Directory", Directory], lambda input : {
-                                                            "oneOf": [
-                                                                { "type": "string", "format": "uri" },
-                                                                { "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/item.json" },
-                                                                { "$ref": "https://schemas.stacspec.org/v1.0.0/collection-spec/json-schema/collection.json" }
-                                                            ]
-                                                        })
-        
+            "oneOf": [
+                { "type": "string", "format": "uri" },
+                { "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/item.json" },
+                { "$ref": "https://schemas.stacspec.org/v1.0.0/collection-spec/json-schema/collection.json" }
+            ]
+        })
 
         # these are not correctly interpreted as CWL types
         _map_type("record", self._on_record)
@@ -252,6 +270,43 @@ class BaseCWLtypes2OGCConverter(__CWLtypes2OGCConverter__):
         name: str
     ) -> str:
         return name[name.rfind('/') + 1:]
+
+    def _resolve_format(
+        self,
+        format_value: str
+    ) -> str:
+        """
+        Resolves a format value with namespace prefix to a full URI.
+
+        Args:
+            format_value (str): Format value like "iana:image/png" or a full URI
+
+        Returns:
+            str: Resolved full URI or original value if no namespace found
+        """
+        if not format_value:
+            return None
+
+        # If it's already a full URI, return it
+        if format_value.startswith('http://') or format_value.startswith('https://'):
+            return format_value
+
+        # Check if it has a namespace prefix
+        if ':' in format_value:
+            prefix, local = format_value.split(':', 1)
+
+            # Try to resolve the namespace from loadingOptions.namespaces
+            namespaces = None
+            if hasattr(self.cwl, 'loadingOptions') and self.cwl.loadingOptions:
+                if hasattr(self.cwl.loadingOptions, 'namespaces'):
+                    namespaces = self.cwl.loadingOptions.namespaces
+
+            if namespaces and prefix in namespaces:
+                namespace_uri = namespaces[prefix]
+                return f"{namespace_uri}{local}"
+
+        # If we couldn't resolve it, return as is
+        return format_value
 
     def _is_nullable(
         self,
@@ -336,29 +391,43 @@ class BaseCWLtypes2OGCConverter(__CWLtypes2OGCConverter__):
     ) -> Mapping[str, Any]:
         type: MutableMapping[str, Any] = {}
 
-        if isinstance(input, str):
-            if input in self._CWL_TYPES__:
-                type.update(self._CWL_TYPES__[input](input))
-            else:
-                type.update(self._search_type_in_dictionary(input))
-        elif hasattr(input, "type_"):
-            if isinstance(input.type_, str):
-                if input.type_ in self._CWL_TYPES__:
-                    type.update(self._CWL_TYPES__[input.type_](input))
+        # Debug logging
+        input_name = getattr(input, 'id', 'unknown') if hasattr(input, 'id') else str(input)
+        input_type = getattr(input, 'type_', 'no_type') if hasattr(input, 'type_') else input.__class__.__name__
+
+        try:
+            if isinstance(input, str):
+                if input in self._CWL_TYPES__:
+                    mapper = self._CWL_TYPES__[input]
+                    result = mapper(input)
+                    type.update(result)
                 else:
-                    type.update(self._search_type_in_dictionary(input.type_))
-            elif input.type_.__class__ in self._CWL_TYPES__:
-                type.update(self._CWL_TYPES__[input.type_.__class__](input))
+                    type.update(self._search_type_in_dictionary(input))
+            elif hasattr(input, "type_"):
+                if isinstance(input.type_, str):
+                    if input.type_ in self._CWL_TYPES__:
+                        mapper = self._CWL_TYPES__[input.type_]
+                        result = mapper(input)
+                        type.update(result)
+                    else:
+                        type.update(self._search_type_in_dictionary(input.type_))
+                elif input.type_.__class__ in self._CWL_TYPES__:
+                    mapper = self._CWL_TYPES__[input.type_.__class__]
+                    result = mapper(input)
+                    type.update(result)
+                else:
+                    self._warn_unsupported_type(input.type_)
             else:
-                self._warn_unsupported_type(input.type_)
-        else:
-            logger.warning(f"I still don't know what to do for {input}")
+                logger.warning(f"I still don't know what to do for {input}")
 
-        default_value = getattr(input, "default", None)
-        if default_value:
-            type["default"] = default_value
+            default_value = getattr(input, "default", None)
+            if default_value:
+                type["default"] = copy.deepcopy(default_value)
 
-        return type
+            return type
+        except Exception as e:
+            logger.error(f"Error in _on_input for {input_name}: {e}", exc_info=True)
+            raise
 
     def _on_list(self, input) -> Mapping[str, Any]:
         input_list: MutableMapping[str, Any] = {
