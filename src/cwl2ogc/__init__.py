@@ -34,7 +34,8 @@ from cwl_utils.parser import (
     OutputEnumSchema,
     OutputParameter,
     OutputRecordSchema,
-    Process
+    Process,
+    load_document_by_yaml
 )
 from io import IOBase
 from loguru import logger
@@ -45,11 +46,13 @@ from typing import (
     List,
     Mapping,
     MutableMapping,
+    Optional,
     TextIO,
     Union
 )
 import cwl_utils
 import json
+import yaml
 
 __CommandInputEnumSchema__ = Union[cwl_v1_0.CommandInputEnumSchema,
                                    cwl_v1_1.CommandInputEnumSchema,
@@ -704,3 +707,40 @@ class BaseCWLtypes2OGCConverter(__CWLtypes2OGCConverter__):
             stream=stream,
             pretty_print=pretty_print
         )
+
+
+def load_converter_from_string_content(
+    cwl_content: str,
+    workflow_id: Optional[str] = None,
+    uri: str = "io://"
+) -> BaseCWLtypes2OGCConverter:
+    """Loads a CWL converter from YAML string content.
+
+    Args:
+        cwl_content: Raw CWL YAML/JSON content.
+        workflow_id: Optional workflow ID when document contains a graph/list.
+        uri: Base URI used by CWL parser.
+
+    Returns:
+        A configured `BaseCWLtypes2OGCConverter` instance.
+    """
+    cwl_yaml = yaml.safe_load(cwl_content)
+    cwl_document = load_document_by_yaml(yaml=cwl_yaml, uri=uri, load_all=True)
+
+    if isinstance(cwl_document, list):
+        if workflow_id is not None:
+            for process in cwl_document:
+                process_id = process.id.split("#")[-1]
+                if workflow_id in [process.id, process_id]:
+                    return BaseCWLtypes2OGCConverter(process)
+            raise ValueError(f"Workflow '{workflow_id}' not found in CWL document")
+
+        if len(cwl_document) == 1:
+            return BaseCWLtypes2OGCConverter(cwl_document[0])
+
+        raise ValueError(
+            "CWL document contains multiple processes. "
+            "Provide workflow_id to select one."
+        )
+
+    return BaseCWLtypes2OGCConverter(cwl_document)
