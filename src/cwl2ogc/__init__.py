@@ -31,6 +31,7 @@ from cwl_utils.parser import (
     OutputParameter,
     OutputRecordSchema,
     Process,
+    load_document_by_uri,
 )
 
 from loguru import logger
@@ -43,9 +44,12 @@ from typing import (
     MutableMapping,
     TextIO,
     Union,
+    Optional,
 )
 
 import json
+import tempfile
+import os
 
 __CommandInputEnumSchema__ = Union[
     cwl_v1_0.CommandInputEnumSchema,
@@ -183,17 +187,8 @@ class BaseCWLtypes2OGCConverter(__CWLtypes2OGCConverter__):
         _map_type("boolean", lambda input: {"type": "boolean"})
         _map_type(["string", "stdout"], lambda input: {"type": "string"})
 
-        _map_type(
-            ["File", File],
-            lambda input: {
-                "oneOf": [
-                    {"type": "string", "format": "uri"},
-                    {
-                        "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/item.json"
-                    },
-                ]
-            },
-        )
+        _map_type(["File", File], self._file_mapper)
+
         _map_type(
             ["Directory", Directory],
             lambda input: {
@@ -259,6 +254,33 @@ class BaseCWLtypes2OGCConverter(__CWLtypes2OGCConverter__):
             ],
             self._on_record_schema,
         )
+
+    def _file_mapper(self, input):
+        # Check if input has format attribute
+        if hasattr(input, 'format') and input.format:
+            fmt = input.format
+            # cwl_utils may fail to resolve namespace prefixes and fall back to
+            # appending the format as a relative path to the output's base URI.
+            # Strip the output ID prefix in that case.
+            input_id = getattr(input, 'id', None)
+            if input_id and fmt.startswith(input_id + '/'):
+                fmt = fmt[len(input_id) + 1:]
+            # If we have a specific format, use a simple schema with contentMediaType
+            schema = {
+                "type": "string",
+                "contentEncoding": "binary",
+                "contentMediaType": fmt
+            }
+            return schema
+
+        # Default schema without format (generic file alternatives)
+        schema = {
+            "oneOf": [
+                { "type": "string", "format": "uri" },
+                { "$ref": "https://schemas.stacspec.org/v1.0.0/item-spec/json-schema/item.json" }
+            ]
+        }
+        return schema
 
     def _clean_name(self, name: str) -> str:
         return name[name.rfind("/") + 1 :]
@@ -568,3 +590,35 @@ class BaseCWLtypes2OGCConverter(__CWLtypes2OGCConverter__):
             stream=stream,
             pretty_print=pretty_print,
         )
+
+
+def load_converter_from_string_content(
+    cwl_content: str,
+    workflow_id: Optional[str] = None,
+) -> BaseCWLtypes2OGCConverter:
+    """Loads a CWL converter from raw CWL string content.
+
+    Args:
+        cwl_content: Raw CWL YAML/JSON content as a string.
+        workflow_id: Optional workflow ID to select when the document contains
+            multiple processes (e.g. a ``$graph``).
+
+    Returns:
+        A configured :class:`BaseCWLtypes2OGCConverter` instance.
+    """
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".cwl", delete=False, encoding="utf-8"
+    ) as tmp:
+        tmp.write(cwl_content)
+        tmp_path = tmp.name
+
+    try:
+        uri = f"file://{tmp_path}"
+        if workflow_id:
+            uri = f"{uri}#{workflow_id}"
+        cwl_process = load_document_by_uri(uri)
+    finally:
+        os.unlink(tmp_path)
+
+    return BaseCWLtypes2OGCConverter(cwl_process)
+
